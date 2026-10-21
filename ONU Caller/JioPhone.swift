@@ -6,6 +6,7 @@ import Foundation
 import Network
 import CryptoKit
 import Darwin
+import AVFoundation
 
 // MARK: - Small helpers
 
@@ -417,10 +418,10 @@ final class JioPhone {
     private var media: RTPMedia?
     private var mediaLogged = false
     private var audio: AudioIO?
-    private var ring: RingTone?
+    private var ringPlayer: AVAudioPlayer?
     private var curCfg: AudioCfg?
     private var muted = false
-    private var speakerOn = false
+    private var speakerOn = true
 
     // MARK: public API
 
@@ -437,7 +438,7 @@ final class JioPhone {
 
     func setMute(_ on: Bool) { q.async { self.muted = on; self.audio?.muted = on } }
 
-    func setSpeaker(_ on: Bool) { q.async { self.speakerOn = on; self.audio?.setSpeaker(on); self.ring?.setSpeaker(on) } }
+    func setSpeaker(_ on: Bool) { q.async { self.speakerOn = on; self.audio?.setSpeaker(on) } }
 
     // MARK: logging / status
 
@@ -456,7 +457,7 @@ final class JioPhone {
         log(why)
         status(why)
         timer?.cancel(); timer = nil
-        ring?.stop(); ring = nil
+        ringPlayer?.stop(); ringPlayer = nil
         audio?.stop(); audio = nil
         if let m = media { log("RTP sent \(m.tx) packets, received \(m.rx) packets"); m.stop() }
         conn?.cancel()
@@ -640,7 +641,7 @@ final class JioPhone {
         if ticks % 10 == 0 { send("\r\n\r\n") }                       // TLS keep-alive
         guard phase == .calling else { return }
         if answered || (audio?.decodedCount ?? 0) > 10 {
-            if ring != nil || audio != nil { audio?.stopRing(); ring?.stop(); ring = nil }
+            if ringPlayer != nil || audio != nil { audio?.stopRing(); stopRingTone() }
         }
         if ticks % 3 == 0, let m = media {
             log("RTP tx \(m.tx)  rx \(m.rx)  decodable \(m.good)  other-pt \(m.otherPT)")
@@ -826,13 +827,65 @@ final class JioPhone {
             a.setSpeaker(speakerOn)
             audio = a
             log("audio started")
-            if let r = ring {                       // hand the tone over to the voice engine
-                r.stop(); ring = nil
-                if !answered { a.startRing() }
-            }
+            stopRingTone()
+            if !answered { a.startRing() }
         } catch {
             log("audio error: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: local ringback tone (AVAudioPlayer, no second AVAudioEngine)
+
+    private func startRingTone(speaker: Bool) {
+        stopRingTone()
+        guard let data = makeRingWavData() else { return }
+        do {
+            let player = try AVAudioPlayer(data: data)
+            player.numberOfLoops = -1
+            player.volume = 1.0
+            player.play()
+            ringPlayer = player
+        } catch {
+            log("ring tone error: \(error.localizedDescription)")
+        }
+    }
+
+    private func stopRingTone() {
+        ringPlayer?.stop()
+        ringPlayer = nil
+    }
+
+    private func makeRingWavData() -> Data? {
+        let sr: Double = 16000
+        let total = Int(sr * 3.0)
+        var samples = [Float](repeating: 0, count: total)
+        for i in 0..<total {
+            let t = Double(i) / sr
+            let on = (t < 0.4) || (t >= 0.6 && t < 1.0)
+            samples[i] = on ? Float(0.35 * sin(2 * Double.pi * 400 * t)) : 0
+        }
+        let byteRate = Int(sr) * 2
+        let dataSize = total * 2
+        let chunkSize = 36 + dataSize
+        var data = Data()
+        data.append(contentsOf: "RIFF".utf8)
+        data.append(contentsOf: withUnsafeBytes(of: UInt32(chunkSize)) { Array($0) })
+        data.append(contentsOf: "WAVE".utf8)
+        data.append(contentsOf: "fmt ".utf8)
+        data.append(contentsOf: withUnsafeBytes(of: UInt32(16)) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: UInt16(1)) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: UInt16(1)) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: UInt32(sr)) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: UInt32(byteRate)) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: UInt16(2)) { Array($0) })
+        data.append(contentsOf: withUnsafeBytes(of: UInt16(16)) { Array($0) })
+        data.append(contentsOf: "data".utf8)
+        data.append(contentsOf: withUnsafeBytes(of: UInt32(dataSize)) { Array($0) })
+        for sample in samples {
+            let int16 = Int16(sample * 32767)
+            data.append(contentsOf: withUnsafeBytes(of: int16) { Array($0) })
+        }
+        return data
     }
 
     private func doHangup(_ reason: String) {
@@ -869,11 +922,7 @@ final class JioPhone {
                 status("Ringing…")
                 if !answered && (audio?.decodedCount ?? 0) < 3 {
                     if let a = audio { a.startRing() }
-                    else if ring == nil {
-                        let r = RingTone()
-                        r.start(speaker: speakerOn)
-                        ring = r
-                    }
+                    else { startRingTone(speaker: speakerOn) }
                     log("playing local ringback tone")
                 }
             }
@@ -896,7 +945,7 @@ final class JioPhone {
                 tEnd = Date()
                 return
             }
-            ring?.stop(); ring = nil
+            stopRingTone()
             audio?.stopRing()
             log("CALL CONNECTED")
             status("Connected 00:00")

@@ -96,13 +96,88 @@ func packBE(ft: Int, q: Int, speech: [UInt8]) -> [UInt8] {
     return out
 }
 
+// MARK: - Pull-based playback buffer (jitter buffer + local ringback tone)
+
+final class PlayFifo {
+    private var buf = [Float](repeating: 0, count: 16000)          // 1 s of 16 kHz audio
+    private var r = 0, w = 0, n = 0
+    private var primed = false
+    private let lock = NSLock()
+    private var ringOn = false
+    private var ringPos = 0
+    private var _pulled = 0, _underruns = 0
+    private let tone: [Float] = {
+        // Indian ringback: 400 Hz, 0.4 s on, 0.2 off, 0.4 on, 2.0 off (3 s loop)
+        (0..<48000).map { i in
+            let t = Double(i) / 16000.0
+            let on = (t < 0.4) || (t >= 0.6 && t < 1.0)
+            return on ? Float(0.35 * sin(2 * Double.pi * 400 * t)) : 0
+        }
+    }()
+
+    var level: Int { lock.lock(); defer { lock.unlock() }; return n }
+    var pulled: Int { lock.lock(); defer { lock.unlock() }; return _pulled }
+    var underruns: Int { lock.lock(); defer { lock.unlock() }; return _underruns }
+
+    func setRing(_ on: Bool) {
+        lock.lock()
+        if on && !ringOn { ringPos = 0 }
+        ringOn = on
+        lock.unlock()
+    }
+
+    func push(_ s: [Int16]) {
+        lock.lock()
+        for v in s {
+            if n == buf.count { r = (r + 1) % buf.count; n -= 1 }
+            buf[w] = Float(v) / 32768.0
+            w = (w + 1) % buf.count
+            n += 1
+        }
+        if n > 3200 {                                              // keep latency under 200 ms
+            let drop = n - 1600
+            r = (r + drop) % buf.count
+            n -= drop
+        }
+        lock.unlock()
+    }
+
+    /// Called by the audio system whenever it needs samples.
+    func render(_ out: UnsafeMutablePointer<Float>, _ frames: Int) {
+        lock.lock()
+        _pulled += frames
+        if !primed && n >= 960 { primed = true }                   // wait for 60 ms before starting
+        for i in 0..<frames {
+            var x: Float = 0
+            if primed {
+                if n > 0 { x = buf[r]; r = (r + 1) % buf.count; n -= 1 }
+                else { primed = false; _underruns += 1 }
+            }
+            if ringOn { x += tone[ringPos]; ringPos = (ringPos + 1) % tone.count }
+            out[i] = x
+        }
+        lock.unlock()
+    }
+}
+
+func makeSourceNode(_ fmt: AVAudioFormat, _ fifo: PlayFifo) -> AVAudioSourceNode {
+    AVAudioSourceNode(format: fmt) { _, _, frames, abl -> OSStatus in
+        let list = UnsafeMutableAudioBufferListPointer(abl)
+        for b in list {
+            if let p = b.mData?.assumingMemoryBound(to: Float.self) {
+                fifo.render(p, Int(frames))
+            }
+        }
+        return noErr
+    }
+}
+
 // MARK: - Audio engine
 
 final class AudioIO {
     var cfg: AudioCfg
     private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
-    private let ringPlayer = AVAudioPlayerNode()
+    private let fifo = PlayFifo()
     private let fmt16 = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
     private let outFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
                                        channels: 1, interleaved: true)!
@@ -111,14 +186,11 @@ final class AudioIO {
     private var enc: UnsafeMutableRawPointer?
     private var dec: UnsafeMutableRawPointer?
     private var acc = [Int16]()
-    private var pending = 0
-    private let lock = NSLock()
     private let codecLock = NSLock()
     private var running = false
     private var observers = [NSObjectProtocol]()
     private var micBufs = 0, encoded = 0, decoded = 0
     private var rxPeak = 0
-    private var lastDone = Date()
 
     var decodedCount: Int { decoded }
     var muted = false
@@ -140,28 +212,23 @@ final class AudioIO {
         dec = D_IF_init()
         codecLock.unlock()
 
-        // Voice processing must be switched on BEFORE the nodes are wired, otherwise the
-        // output/input formats change under us and both directions go silent.
+        // Voice processing (echo cancel) must be switched on BEFORE the nodes are wired.
         do { try engine.inputNode.setVoiceProcessingEnabled(true) }
         catch { onLog?("voice processing unavailable: \(error.localizedDescription)") }
 
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: fmt16)
-        engine.attach(ringPlayer)
-        engine.connect(ringPlayer, to: engine.mainMixerNode, format: fmt16)
+        let node = makeSourceNode(fmt16, fifo)
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: fmt16)
+        engine.mainMixerNode.outputVolume = 1
 
-        // nil format: use whatever the (voice-processed) mic really delivers
         engine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { [weak self] buf, _ in
             self?.handleMic(buf)
         }
-        player.volume = 1
-        engine.mainMixerNode.outputVolume = 1
         engine.prepare()
         try engine.start()
-        player.play()
         running = true
+        onLog?("engine started, output format \(Int(engine.outputNode.outputFormat(forBus: 0).sampleRate)) Hz")
 
-        // iOS stops the engine on route/format changes (speaker toggle, Bluetooth...). Restart it.
         observers.append(NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil) { [weak self] _ in
             self?.restart()
@@ -179,19 +246,9 @@ final class AudioIO {
     private func restart() {
         guard running else { return }
         if !engine.isRunning {
-            do {
-                try engine.start()
-                onLog?("audio engine restarted")
-            } catch {
-                onLog?("audio restart failed: \(error.localizedDescription)")
-                return
-            }
+            do { try engine.start(); onLog?("audio engine restarted") }
+            catch { onLog?("audio restart failed: \(error.localizedDescription)"); return }
         }
-        lock.lock(); pending = 0; lock.unlock()
-        player.volume = 1
-        engine.mainMixerNode.outputVolume = 1
-        player.reset()
-        player.play()
         let s = AVAudioSession.sharedInstance()
         onLog?("audio route now: \(s.currentRoute.outputs.map { $0.portType.rawValue })")
     }
@@ -199,10 +256,10 @@ final class AudioIO {
     func stop() {
         guard running else { return }
         running = false
+        fifo.setRing(false)
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
         engine.inputNode.removeTap(onBus: 0)
-        player.stop()
         engine.stop()
         codecLock.lock()
         if let e = enc { E_IF_exit(e) }
@@ -212,13 +269,8 @@ final class AudioIO {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
-    func startRing() {
-        guard running, !ringPlayer.isPlaying, let b = makeRingBuffer(fmt16) else { return }
-        ringPlayer.scheduleBuffer(b, at: nil, options: .loops, completionHandler: nil)
-        ringPlayer.play()
-    }
-
-    func stopRing() { if ringPlayer.isPlaying { ringPlayer.stop() } }
+    func startRing() { fifo.setRing(true) }
+    func stopRing() { fifo.setRing(false) }
 
     func setSpeaker(_ on: Bool) {
         do {
@@ -229,10 +281,6 @@ final class AudioIO {
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self = self, self.running else { return }
             if !self.engine.isRunning { self.restart() }
-            else {
-                self.lock.lock(); self.pending = 0; self.lock.unlock()
-                if !self.player.isPlaying { self.player.play() }
-            }
             let outs = AVAudioSession.sharedInstance().currentRoute.outputs.map { $0.portType.rawValue }
             self.onLog?("speaker \(on ? "ON" : "OFF") -> output \(outs)")
         }
@@ -253,7 +301,7 @@ final class AudioIO {
         guard let mf = monoFmt, let conv = converter,
               let mono = AVAudioPCMBuffer(pcmFormat: mf, frameCapacity: buf.frameLength) else { return }
         mono.frameLength = buf.frameLength
-        mono.floatChannelData![0].update(from: src[0], count: Int(buf.frameLength))   // channel 0 only
+        mono.floatChannelData![0].update(from: src[0], count: Int(buf.frameLength))
 
         let cap = AVAudioFrameCount(Double(buf.frameLength) * 16000.0 / sr) + 64
         guard let out = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: cap) else { return }
@@ -314,63 +362,19 @@ final class AudioIO {
             for v in synth { pk = max(pk, abs(Int(v))) }
             rxPeak = max(rxPeak, pk)
             if decoded % 150 == 0 {
-                lock.lock(); let pd = pending; lock.unlock()
-                onLog?("rx decoded \(decoded), peak level \(rxPeak)/32767, queued \(pd), engine \(engine.isRunning ? "on" : "OFF"), player \(player.isPlaying ? "on" : "OFF")")
+                onLog?("rx decoded \(decoded), peak \(rxPeak)/32767, buffered \(fifo.level), output pulled \(fifo.pulled), underruns \(fifo.underruns), engine \(engine.isRunning ? "on" : "OFF")")
                 rxPeak = 0
             }
-            enqueue(synth)
-        }
-    }
-
-    private func enqueue(_ s: [Int16]) {
-        lock.lock()
-        if pending > 12 {
-            if Date().timeIntervalSince(lastDone) > 0.5 {         // counter stuck -> reset
-                pending = 0
-                lock.unlock()
-                player.reset(); player.play()
-                onLog?("playback queue was stuck, reset")
-                lock.lock()
-            } else { lock.unlock(); return }                      // keep latency bounded
-        }
-        pending += 1
-        lock.unlock()
-        guard let buf = AVAudioPCMBuffer(pcmFormat: fmt16, frameCapacity: 320),
-              let p = buf.floatChannelData?[0] else {
-            lock.lock(); pending -= 1; lock.unlock()
-            return
-        }
-        buf.frameLength = 320
-        for i in 0..<320 { p[i] = Float(s[i]) / 32768.0 }
-        if !player.isPlaying && engine.isRunning { player.play() }
-        player.scheduleBuffer(buf) { [weak self] in
-            self?.lock.lock()
-            self?.pending = max(0, (self?.pending ?? 1) - 1)
-            self?.lastDone = Date()
-            self?.lock.unlock()
+            fifo.push(synth)
         }
     }
 }
 
-func makeRingBuffer(_ fmt: AVAudioFormat) -> AVAudioPCMBuffer? {
-    let sr = fmt.sampleRate
-    let total = Int(sr * 3.0)
-    guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(total)),
-          let p = buf.floatChannelData?[0] else { return nil }
-    buf.frameLength = AVAudioFrameCount(total)
-    for i in 0..<total {
-        let t = Double(i) / sr
-        let on = (t < 0.4) || (t >= 0.6 && t < 1.0)          // Indian ringback cadence
-        p[i] = on ? Float(0.35 * sin(2 * Double.pi * 400 * t)) : 0
-    }
-    return buf
-}
-
-// MARK: - Local ringback tone (used when the network sends "ringing" without audio)
+// MARK: - Local ringback tone (before the voice engine exists)
 
 final class RingTone {
     private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    private let fifo = PlayFifo()
     private var running = false
 
     func start(speaker: Bool) {
@@ -379,14 +383,13 @@ final class RingTone {
         try? s.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP])
         try? s.setActive(true)
         try? s.overrideOutputAudioPort(speaker ? .speaker : .none)
-
-        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1),
-              let buf = makeRingBuffer(fmt) else { return }
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: fmt)
-        player.scheduleBuffer(buf, at: nil, options: .loops, completionHandler: nil)
+        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1) else { return }
+        let node = makeSourceNode(fmt, fifo)
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: fmt)
+        fifo.setRing(true)
         engine.prepare()
-        do { try engine.start(); player.play(); running = true } catch { running = false }
+        do { try engine.start(); running = true } catch { running = false }
     }
 
     func setSpeaker(_ on: Bool) {
@@ -396,7 +399,7 @@ final class RingTone {
     func stop() {
         guard running else { return }
         running = false
-        player.stop()
+        fifo.setRing(false)
         engine.stop()
     }
 }
