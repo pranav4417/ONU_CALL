@@ -1,0 +1,10 @@
+prefix=/var/folders/yj/4rx2l1lx1r5cnqlbtkplmw9m0000gn/T/tmp.wX0w8LvB1K/out
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: OpenCORE AMR-WB
+Description: Adaptive Multi-Rate Wideband speech codec library
+Version: 0.1.6
+Libs: -L${libdir} -lopencore-amrwb
+Cflags: -I${includedir}
